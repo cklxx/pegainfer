@@ -191,6 +191,39 @@ pub fn add_inplace(ctx: &DeviceContext, a: &mut DeviceVec, b: &DeviceVec) -> Res
     Ok(())
 }
 
+/// Fused add + RMSNorm: hidden += residual; out = rms_norm(hidden, weight)
+/// Saves one global read of hidden compared to separate add + rms_norm.
+pub fn fused_add_rms_norm_into(
+    ctx: &DeviceContext,
+    hidden: &mut DeviceVec,
+    residual: &DeviceVec,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(hidden.len, residual.len);
+    assert_eq!(hidden.len, out.len);
+
+    let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::fused_add_rms_norm_cuda(
+            h_ptr as *mut ffi::Half,
+            r_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            hidden.len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Element-wise add (allocating)
 pub fn add(ctx: &DeviceContext, a: &DeviceVec, b: &DeviceVec) -> Result<DeviceVec> {
     assert_eq!(a.len, b.len);

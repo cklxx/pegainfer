@@ -489,6 +489,9 @@ impl Qwen3Model {
     /// Pure kernel sequence for decode — no CPU-GPU sync, no allocation.
     /// Called during graph capture and also replayed via CUDA Graph.
     fn decode_kernels(&self, kv_cache: &mut KVCache, bufs: &mut DecodeBuffers) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+        let num_layers = self.layers.len();
+
         // 1. Embedding (reads token_id from decode_meta[0])
         ops::embedding_decode_into(
             &self.ctx,
@@ -497,21 +500,38 @@ impl Qwen3Model {
             &mut bufs.hidden,
         )?;
 
-        // 2. All transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.decode_layer(layer_idx, layer, kv_cache, bufs)?;
-        }
-
-        // 3. Final norm
+        // 2. First layer input norm (standalone — no prior residual to fuse with)
         ops::rms_norm_into(
             &self.ctx,
             &bufs.hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
+            &self.layers[0].input_layernorm,
+            eps,
             &mut bufs.normed,
         )?;
 
-        // 4. LM Head
+        // 3. All transformer layers
+        //    Each layer assumes normed is already filled by the previous step.
+        //    Post-MLP residual is fused with the next norm (next layer's input or final norm).
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.decode_layer_inner(layer_idx, layer, kv_cache, bufs)?;
+
+            // Fused: hidden += mlp_out; normed = rms_norm(hidden, next_weight)
+            let next_weight = if layer_idx + 1 < num_layers {
+                &self.layers[layer_idx + 1].input_layernorm
+            } else {
+                &self.norm // final norm for last layer
+            };
+            ops::fused_add_rms_norm_into(
+                &self.ctx,
+                &mut bufs.hidden,
+                &bufs.mlp_out,
+                next_weight,
+                eps,
+                &mut bufs.normed,
+            )?;
+        }
+
+        // 4. LM Head (normed already computed by last fused_add_rms_norm)
         ops::gemv(
             &self.ctx,
             &self.embed_tokens,
@@ -522,7 +542,9 @@ impl Qwen3Model {
         Ok(())
     }
 
-    fn decode_layer(
+    /// Inner decode layer: assumes normed is pre-filled, does NOT do post-MLP residual.
+    /// Post-MLP residual + next norm is handled by the caller via fused_add_rms_norm.
+    fn decode_layer_inner(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
@@ -534,14 +556,7 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        // Input RMSNorm: hidden → normed
-        ops::rms_norm_into(
-            &self.ctx,
-            &bufs.hidden,
-            &layer.input_layernorm,
-            eps,
-            &mut bufs.normed,
-        )?;
+        // normed is already filled (by caller)
 
         // QKV projection: normed → q, k, v (3× gemv)
         ops::gemv(
@@ -593,19 +608,17 @@ impl Qwen3Model {
             &mut bufs.attn_proj,
         )?;
 
-        // Residual: hidden += attn_proj
-        ops::add_inplace(&self.ctx, &mut bufs.hidden, &bufs.attn_proj)?;
-
-        // Post-attention RMSNorm: hidden → normed
-        ops::rms_norm_into(
+        // Fused residual + post-attention RMSNorm: hidden += attn_proj; normed = rms_norm(hidden)
+        ops::fused_add_rms_norm_into(
             &self.ctx,
-            &bufs.hidden,
+            &mut bufs.hidden,
+            &bufs.attn_proj,
             &layer.post_attention_layernorm,
             eps,
             &mut bufs.normed,
         )?;
 
-        // Fused MLP: normed → mlp_out
+        // Fused MLP: normed → mlp_out (post-MLP residual handled by caller)
         ops::fused_mlp_into(
             &self.ctx,
             &bufs.normed,
@@ -615,9 +628,6 @@ impl Qwen3Model {
             &mut bufs.mlp_act,
             &mut bufs.mlp_out,
         )?;
-
-        // Residual: hidden += mlp_out
-        ops::add_inplace(&self.ctx, &mut bufs.hidden, &bufs.mlp_out)?;
 
         Ok(())
     }

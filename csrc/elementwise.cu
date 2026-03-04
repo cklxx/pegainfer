@@ -1,12 +1,40 @@
 #include "common.cuh"
 
-// Element-wise add: out = a + b
+// Element-wise add: out = a + b (BF16×4 vectorized)
 __global__ void add_kernel(const __nv_bfloat16 *__restrict__ a,
                            const __nv_bfloat16 *__restrict__ b, __nv_bfloat16 *__restrict__ out,
                            int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    out[idx] = a[idx] + b[idx];
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int n4 = n / 4;
+
+  if (tid < n4) {
+    const uint2 *a_vec = reinterpret_cast<const uint2 *>(a);
+    const uint2 *b_vec = reinterpret_cast<const uint2 *>(b);
+    uint2 *out_vec = reinterpret_cast<uint2 *>(out);
+
+    uint2 av = a_vec[tid];
+    uint2 bv = b_vec[tid];
+    __nv_bfloat162 a_lo = *reinterpret_cast<__nv_bfloat162 *>(&av.x);
+    __nv_bfloat162 a_hi = *reinterpret_cast<__nv_bfloat162 *>(&av.y);
+    __nv_bfloat162 b_lo = *reinterpret_cast<__nv_bfloat162 *>(&bv.x);
+    __nv_bfloat162 b_hi = *reinterpret_cast<__nv_bfloat162 *>(&bv.y);
+
+    __nv_bfloat162 r_lo, r_hi;
+    r_lo.x = __float2bfloat16(__bfloat162float(a_lo.x) + __bfloat162float(b_lo.x));
+    r_lo.y = __float2bfloat16(__bfloat162float(a_lo.y) + __bfloat162float(b_lo.y));
+    r_hi.x = __float2bfloat16(__bfloat162float(a_hi.x) + __bfloat162float(b_hi.x));
+    r_hi.y = __float2bfloat16(__bfloat162float(a_hi.y) + __bfloat162float(b_hi.y));
+
+    uint2 result;
+    result.x = *reinterpret_cast<unsigned int *>(&r_lo);
+    result.y = *reinterpret_cast<unsigned int *>(&r_hi);
+    out_vec[tid] = result;
+  }
+
+  // Scalar tail
+  int scalar_idx = n4 * 4 + (blockIdx.x * blockDim.x + threadIdx.x);
+  if (scalar_idx >= n4 * 4 && scalar_idx < n) {
+    out[scalar_idx] = __float2bfloat16(__bfloat162float(a[scalar_idx]) + __bfloat162float(b[scalar_idx]));
   }
 }
 
@@ -77,7 +105,9 @@ extern "C" {
 void add_cuda(const __nv_bfloat16 *a, const __nv_bfloat16 *b, __nv_bfloat16 *out, int n,
               cudaStream_t stream) {
   int block_size = 256;
-  int num_blocks = (n + block_size - 1) / block_size;
+  int n4 = n / 4;
+  int num_blocks = (n4 + block_size - 1) / block_size;
+  if (num_blocks == 0) num_blocks = 1;  // handle n < 4
   add_kernel<<<num_blocks, block_size, 0, stream>>>(a, b, out, n);
 }
 

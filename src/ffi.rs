@@ -35,6 +35,16 @@ unsafe extern "C" {
 
     pub fn add_cuda(a: *const Half, b: *const Half, out: *mut Half, n: i32, stream: CUstream);
 
+    pub fn fused_add_rms_norm_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
     pub fn copy_cuda(src: *const Half, dst: *mut Half, n: i32, stream: CUstream);
 
     pub fn silu_mul_cuda(
