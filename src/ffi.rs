@@ -202,6 +202,52 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
+    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
+    pub fn flash_attention_prefill_hd256_cuda(
+        Q: *const Half,
+        K_cache: *const Half,
+        V_cache: *const Half,
+        Output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        gqa_ratio: i32,
+        seq_len: i32,
+        start_pos: i32,
+        q_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
+    pub fn prefill_attention_hd256_prep_cuda(
+        q_full_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Apply sigmoid(gate) from interleaved q_full onto attention output in-place.
+    pub fn attention_gate_batch_hd256_cuda(
+        q_full_batch: *const Half,
+        attn_out: *mut Half,
+        num_q_heads: i32,
+        seq_len: i32,
+        stream: CUstream,
+    );
+
     // Fused GQA Attention — prefill variant (scalar pos/seq_len, per-position cos/sin)
     pub fn fused_gqa_attention_single_token(
         q_full: *const Half,
@@ -261,6 +307,17 @@ unsafe extern "C" {
     // ========================================================================
     // Qwen3.5 kernels
     // ========================================================================
+
+    // Batched (1+weight) RMSNorm — one block per token
+    pub fn rms_norm_batched_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    );
 
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub fn rms_norm_offset_cuda(
@@ -334,6 +391,103 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        g_out: *mut f32,
+        beta_out: *mut f32,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        qkv_dim: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_cumsum_cuda(
+        g_in: *const f32,
+        g_out: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_a_cuda(
+        k: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        a_tril: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_solve_cuda(
+        a_tril: *const f32,
+        a_inv: *mut Half,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunk_recompute_cuda(
+        k: *const Half,
+        v: *const Half,
+        beta: *const f32,
+        w: *mut Half,
+        u: *mut Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Chunk-wise GDR prefill stage 1 (Triton AOT): recurrent chunk-state update.
+    // Expected future inputs:
+    //   k / w: [seq_len, num_value_heads, 128] bf16
+    //   u / v_new: [seq_len, num_value_heads, 128] bf16
+    //   g_cumsum: [seq_len, num_value_heads] fp32
+    //   initial_state / final_state: [num_value_heads, 128, 128] fp32 in [H, V, K]
+    //   chunk_state: [num_chunks, num_value_heads, 128, 128] fp32
+    pub fn gated_delta_rule_prefill_chunk_state_cuda(
+        k: *const Half,
+        w: *const Half,
+        u: *const Half,
+        g_cumsum: *const f32,
+        initial_state: *const f32,
+        chunk_state: *mut f32,
+        v_new: *mut Half,
+        final_state: *mut f32,
+        seq_len: i32,
+        num_value_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Chunk-wise GDR prefill stage 2 (Triton AOT): chunk output accumulation.
+    // Expected future inputs:
+    //   q / k / v_new: [seq_len, num_value_heads, 128] bf16
+    //   chunk_state: [num_chunks, num_value_heads, 128, 128] fp32
+    //   g_cumsum: [seq_len, num_value_heads] fp32
+    //   output: [seq_len, num_value_heads * 128] bf16
+    pub fn gated_delta_rule_prefill_chunk_o_cuda(
+        q: *const Half,
+        k: *const Half,
+        v_new: *const Half,
+        chunk_state: *const f32,
+        g_cumsum: *const f32,
+        output: *mut Half,
+        seq_len: i32,
+        num_value_heads: i32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // Fused GQA attention HD256 — decode variant (reads pos/seq_len from decode_meta)
     pub fn fused_gqa_attention_hd256_decode(
         q_full: *const Half,
@@ -356,26 +510,4 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused GQA attention HD256 — single token variant (scalar pos/seq_len)
-    pub fn fused_gqa_attention_hd256_single_token(
-        q_full: *const Half,
-        k_full: *const Half,
-        v_full: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        output: *mut Half,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        current_pos: i32,
-        seq_len: i32,
-        rotary_dim: i32,
-        scale: f32,
-        rms_eps: f32,
-        stream: CUstream,
-    );
 }

@@ -18,6 +18,7 @@ use crate::decode_buffers35::DecodeBuffers35;
 use crate::kv_cache::KVCache;
 use crate::model::StreamingStats;
 use crate::ops;
+use crate::prefill_buffers35::GdrChunkwiseScratch35;
 use crate::qwen35_config::{Config35, LayerType};
 use crate::recurrent_state::RecurrentState;
 use crate::sampler::{self, SamplingParams};
@@ -661,12 +662,14 @@ impl Qwen35Model {
         // Process layers
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
+        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden_batch = self.prefill_layer(
                 layer_idx,
                 layer,
                 hidden_batch,
+                &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 kv_cache,
@@ -705,6 +708,7 @@ impl Qwen35Model {
         _layer_idx: usize,
         layer: &TransformerBlock35,
         hidden_batch: HiddenStates,
+        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         kv_cache: &mut KVCache,
@@ -729,53 +733,31 @@ impl Qwen35Model {
         // Batch project, then per-token attention/recurrent
         let attn_results = match &layer.attn {
             LayerKind::FullAttention(attn) => {
-                let q_batch = ops::gemm(&self.ctx, &attn.q_proj, &normed_batch)?;
+                let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, &normed_batch)?;
                 let k_batch = ops::gemm(&self.ctx, &attn.k_proj, &normed_batch)?;
                 let v_batch = ops::gemm(&self.ctx, &attn.v_proj, &normed_batch)?;
-
-                let scale = 1.0 / (c.head_dim as f32).sqrt();
                 let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
 
-                // Each full attention layer processes tokens at the SAME positions.
-                // Don't increment kv_cache.seq_len per-token here; advance once at end.
                 let base_pos = kv_cache.len();
-                for t in 0..seq_len {
-                    let q = ops::extract_vec(&self.ctx, &q_batch, t)?;
-                    let k = ops::extract_vec(&self.ctx, &k_batch, t)?;
-                    let v = ops::extract_vec(&self.ctx, &v_batch, t)?;
-
-                    let pos = base_pos + t;
-                    let attn_seq = pos + 1;
-
-                    let cos_pos = self.cos_cache.view(pos * c.rotary_dim, c.rotary_dim);
-                    let sin_pos = self.sin_cache.view(pos * c.rotary_dim, c.rotary_dim);
-
-                    let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
-                    let mut attn_out = DeviceVec::zeros(&self.ctx, attn_out_dim)?;
-
-                    ops::fused_attention_hd256_single_token_into(
-                        &self.ctx,
-                        &q,
-                        &k,
-                        &v,
-                        &attn.q_norm,
-                        &attn.k_norm,
-                        &cos_pos,
-                        &sin_pos,
-                        kc,
-                        vc,
-                        &mut attn_out,
-                        c.num_attention_heads,
-                        c.num_key_value_heads,
-                        pos,
-                        attn_seq,
-                        c.rotary_dim,
-                        scale,
-                        eps,
-                    )?;
-
-                    ops::write_vec(&self.ctx, &mut attn_out_batch, t, &attn_out)?;
-                }
+                let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
+                ops::prefill_attention_hd256_batch(
+                    &self.ctx,
+                    &q_full_batch,
+                    &k_batch,
+                    &v_batch,
+                    &attn.q_norm,
+                    &attn.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    kc,
+                    vc,
+                    &mut attn_out_batch,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    base_pos,
+                    c.rotary_dim,
+                    eps,
+                )?;
 
                 *full_idx += 1;
 
@@ -793,63 +775,49 @@ impl Qwen35Model {
                 let z_dim = c.linear_attn_z_dim();
                 let layer_state = &mut recurrent.layers[*linear_idx];
 
-                let mut out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
+                let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
+                ops::conv1d_prefill_batch_into(
+                    &self.ctx,
+                    &qkv_batch,
+                    &attn.conv1d_weight,
+                    &mut layer_state.conv_state,
+                    &mut qkv_conv_batch,
+                    c.linear_conv_kernel_dim,
+                )?;
 
-                // Sequential: conv1d + gated delta rule per token
-                for t in 0..seq_len {
-                    let qkv_raw = ops::extract_vec(&self.ctx, &qkv_batch, t)?;
-                    let z = ops::extract_vec(&self.ctx, &z_batch, t)?;
-                    let b = ops::extract_vec(&self.ctx, &b_batch, t)?;
-                    let a = ops::extract_vec(&self.ctx, &a_batch, t)?;
+                let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                ops::gated_delta_rule_prefill_chunkwise_into(
+                    &self.ctx,
+                    &qkv_conv_batch,
+                    &b_batch,
+                    &a_batch,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut layer_state.state,
+                    gdr_chunkwise_scratch,
+                    &mut gdr_out_batch,
+                    c.linear_num_key_heads,
+                    c.linear_num_value_heads,
+                    c.linear_key_head_dim,
+                    c.linear_value_head_dim,
+                )?;
 
-                    // Conv1d
-                    let mut qkv_conv = DeviceVec::zeros(&self.ctx, qkv_dim)?;
-                    ops::conv1d_decode_into(
-                        &self.ctx,
-                        &qkv_raw,
-                        &attn.conv1d_weight,
-                        &mut layer_state.conv_state,
-                        &mut qkv_conv,
-                        c.linear_conv_kernel_dim,
-                    )?;
-
-                    // GDR
-                    let mut gdr_out = DeviceVec::zeros(&self.ctx, z_dim)?;
-                    ops::gated_delta_rule_decode_into(
-                        &self.ctx,
-                        &qkv_conv,
-                        &b,
-                        &a,
-                        &attn.dt_bias,
-                        &attn.a_log,
-                        &mut layer_state.state,
-                        &mut gdr_out,
-                        c.linear_num_key_heads,
-                        c.linear_num_value_heads,
-                        c.linear_key_head_dim,
-                        c.linear_value_head_dim,
-                    )?;
-
-                    // Gated norm
-                    let mut normed_out = DeviceVec::zeros(&self.ctx, z_dim)?;
-                    ops::rms_norm_gated_into(
-                        &self.ctx,
-                        &gdr_out,
-                        &attn.norm_weight,
-                        &z,
-                        &mut normed_out,
-                        c.linear_num_value_heads,
-                        c.linear_value_head_dim,
-                        c.rms_norm_eps,
-                    )?;
-
-                    ops::write_vec(&self.ctx, &mut out_batch, t, &normed_out)?;
-                }
+                let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                ops::rms_norm_gated_batch_into(
+                    &self.ctx,
+                    &gdr_out_batch,
+                    &attn.norm_weight,
+                    &z_batch,
+                    &mut normed_out_batch,
+                    c.linear_num_value_heads,
+                    c.linear_value_head_dim,
+                    c.rms_norm_eps,
+                )?;
 
                 *linear_idx += 1;
 
                 // Output projection (batched)
-                ops::gemm(&self.ctx, &attn.out_proj, &out_batch)?
+                ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?
             }
         };
 
@@ -870,7 +838,6 @@ impl Qwen35Model {
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
     }
 
-    /// Batched (1+weight) RMSNorm — per-token iteration (no batched kernel yet).
     fn batched_rms_norm_offset(
         &self,
         x: &HiddenStates,
@@ -878,12 +845,7 @@ impl Qwen35Model {
         eps: f32,
     ) -> Result<HiddenStates> {
         let mut out = HiddenStates::zeros(&self.ctx, x.hidden_dim, x.seq_len)?;
-        for t in 0..x.seq_len {
-            let vec = ops::extract_vec(&self.ctx, x, t)?;
-            let mut normed = DeviceVec::zeros(&self.ctx, x.hidden_dim)?;
-            ops::rms_norm_offset_into(&self.ctx, &vec, weight, eps, &mut normed)?;
-            ops::write_vec(&self.ctx, &mut out, t, &normed)?;
-        }
+        ops::rms_norm_batch_offset_into(&self.ctx, x, weight, eps, &mut out)?;
         Ok(out)
     }
 

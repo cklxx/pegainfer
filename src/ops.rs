@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
+use crate::prefill_buffers35::GdrChunkwiseScratch35;
 use crate::tensor::*;
 
 /// Matrix-vector multiplication: y = A @ x
@@ -622,6 +623,146 @@ pub fn prefill_attention_batch(
     Ok(())
 }
 
+/// FlashAttention-2 prefill for HEAD_DIM=256 with precomputed Q and KV cache.
+/// Q / output layout: HiddenStates [q_dim, seq_len] in column-major token-major storage.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    k_cache: &DeviceVec,
+    v_cache: &DeviceVec,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    start_pos: usize,
+) -> Result<()> {
+    let seq_len = q_batch.seq_len;
+    let q_dim = q_batch.hidden_dim;
+    let head_dim = q_dim / num_q_heads;
+    assert_eq!(head_dim, 256, "HD256 kernel requires head_dim=256");
+    assert_eq!(q_dim, output.hidden_dim, "output hidden_dim mismatch");
+    assert_eq!(seq_len, output.seq_len, "output seq_len mismatch");
+    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
+    let gqa_ratio = num_q_heads / num_kv_heads;
+
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
+    let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::flash_attention_prefill_hd256_cuda(
+            q_ptr as *const ffi::Half,
+            kc_ptr as *const ffi::Half,
+            vc_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            gqa_ratio as i32,
+            seq_len as i32,
+            start_pos as i32,
+            q_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
+/// Qwen3.5 full-attention prefill: prep Q/K/cache, run HD256 FlashAttention-2, then apply gate.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd256_batch(
+    ctx: &DeviceContext,
+    q_full_batch: &HiddenStates,
+    k_batch: &HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm: &DeviceVec,
+    k_norm: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    start_pos: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q_full_batch.seq_len;
+    let q_dim = num_q_heads * 256;
+    let kv_dim = num_kv_heads * 256;
+
+    assert_eq!(q_full_batch.hidden_dim, q_dim * 2);
+    assert_eq!(k_batch.hidden_dim, kv_dim);
+    assert_eq!(v_batch.hidden_dim, kv_dim);
+    assert_eq!(k_batch.seq_len, seq_len);
+    assert_eq!(v_batch.seq_len, seq_len);
+    assert_eq!(output.hidden_dim, q_dim);
+    assert_eq!(output.seq_len, seq_len);
+
+    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+
+    unsafe {
+        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
+        let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
+        let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
+        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
+        let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
+        let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
+        let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
+        let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+        let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+
+        ffi::prefill_attention_hd256_prep_cuda(
+            qf_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qp_ptr as *mut ffi::Half,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            seq_len as i32,
+            start_pos as i32,
+            rotary_dim as i32,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    flash_attention_prefill_hd256_into(
+        ctx,
+        &q_prepped,
+        k_cache,
+        v_cache,
+        output,
+        num_q_heads,
+        num_kv_heads,
+        start_pos,
+    )?;
+
+    unsafe {
+        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+        ffi::attention_gate_batch_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            seq_len as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Fused GQA Attention (allocating)
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention(
@@ -766,9 +907,21 @@ pub fn gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    assert_eq!(weight.cols, x.hidden_dim, "weight cols {} != hidden_dim {}", weight.cols, x.hidden_dim);
-    assert_eq!(out.hidden_dim, weight.rows, "out hidden_dim {} != weight rows {}", out.hidden_dim, weight.rows);
-    assert_eq!(out.seq_len, x.seq_len, "out seq_len {} != x seq_len {}", out.seq_len, x.seq_len);
+    assert_eq!(
+        weight.cols, x.hidden_dim,
+        "weight cols {} != hidden_dim {}",
+        weight.cols, x.hidden_dim
+    );
+    assert_eq!(
+        out.hidden_dim, weight.rows,
+        "out hidden_dim {} != weight rows {}",
+        out.hidden_dim, weight.rows
+    );
+    assert_eq!(
+        out.seq_len, x.seq_len,
+        "out seq_len {} != x seq_len {}",
+        out.seq_len, x.seq_len
+    );
 
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
@@ -977,6 +1130,37 @@ pub fn write_vec(
 // Qwen3.5 ops
 // ============================================================
 
+/// Batched (1+weight) RMSNorm over HiddenStates — one kernel launch for all tokens.
+pub fn rms_norm_batch_offset_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(weight.len, x.hidden_dim);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_batched_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// (1+weight) RMSNorm into pre-allocated output buffer (Gemma/Qwen3.5 style)
 pub fn rms_norm_offset_into(
     ctx: &DeviceContext,
@@ -1075,6 +1259,47 @@ pub fn rms_norm_gated_into(
     Ok(())
 }
 
+/// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
+/// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &CudaSlice<f32>,
+    gate: &HiddenStates,
+    out: &mut HiddenStates,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    let total_heads = x.seq_len * num_heads;
+    assert_eq!(x.hidden_dim, num_heads * head_dim);
+    assert_eq!(gate.hidden_dim, x.hidden_dim);
+    assert_eq!(gate.seq_len, x.seq_len);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::rms_norm_gated_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const f32,
+            g_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            total_heads as i32,
+            head_dim as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Causal depthwise conv1d decode (single step).
 /// Updates conv_state in-place. Applies SiLU activation.
 pub fn conv1d_decode_into(
@@ -1102,6 +1327,43 @@ pub fn conv1d_decode_into(
             s_ptr as *mut ffi::Half,
             o_ptr as *mut ffi::Half,
             num_channels as i32,
+            kernel_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Causal depthwise conv1d prefill over a HiddenStates batch.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_prefill_batch_into(
+    ctx: &DeviceContext,
+    x_seq: &HiddenStates,
+    conv_weight: &DeviceVec,
+    conv_state: &mut DeviceVec,
+    out_seq: &mut HiddenStates,
+    kernel_size: usize,
+) -> Result<()> {
+    let num_channels = x_seq.hidden_dim;
+    assert_eq!(out_seq.hidden_dim, num_channels);
+    assert_eq!(out_seq.seq_len, x_seq.seq_len);
+    assert_eq!(conv_weight.len, num_channels * kernel_size);
+    assert_eq!(conv_state.len, num_channels * (kernel_size - 1));
+
+    let (x_ptr, _gx) = x_seq.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out_seq.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_prefill_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            s_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            x_seq.seq_len as i32,
             kernel_size as i32,
             ctx.stream.cu_stream(),
         );
@@ -1158,6 +1420,369 @@ pub fn gated_delta_rule_decode_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_rule_prefill_chunk_prepare_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    q_out: &mut HiddenStates,
+    k_out: &mut HiddenStates,
+    v_out: &mut HiddenStates,
+    g_out: &mut CudaSlice<f32>,
+    beta_out: &mut CudaSlice<f32>,
+    num_key_heads: usize,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (q_out_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let (k_out_ptr, _gko) = k_out.data.device_ptr_mut(&ctx.stream);
+    let (v_out_ptr, _gvo) = v_out.data.device_ptr_mut(&ctx.stream);
+    let (g_out_ptr, _ggo) = g_out.device_ptr_mut(&ctx.stream);
+    let (beta_out_ptr, _gbetao) = beta_out.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_prepare_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            q_out_ptr as *mut ffi::Half,
+            k_out_ptr as *mut ffi::Half,
+            v_out_ptr as *mut ffi::Half,
+            g_out_ptr as *mut f32,
+            beta_out_ptr as *mut f32,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            qkv.hidden_dim as i32,
+            qkv.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+fn gated_delta_rule_prefill_chunk_cumsum_inplace(
+    ctx: &DeviceContext,
+    g_cumsum: &mut CudaSlice<f32>,
+    seq_len: usize,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (g_ptr, _gg) = g_cumsum.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_cumsum_cuda(
+            g_ptr as *const f32,
+            g_ptr as *mut f32,
+            seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+fn gated_delta_rule_prefill_chunk_a_into(
+    ctx: &DeviceContext,
+    k: &HiddenStates,
+    g_cumsum: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    a_tril: &mut CudaSlice<f32>,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = g_cumsum.device_ptr(&ctx.stream);
+    let (beta_ptr, _gb) = beta.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_tril.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_a_cuda(
+            k_ptr as *const ffi::Half,
+            g_ptr as *const f32,
+            beta_ptr as *const f32,
+            a_ptr as *mut f32,
+            k.seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+fn gated_delta_rule_prefill_chunk_solve_into(
+    ctx: &DeviceContext,
+    a_tril: &CudaSlice<f32>,
+    a_inv: &mut CudaSlice<half::bf16>,
+    seq_len: usize,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (a_ptr, _ga) = a_tril.device_ptr(&ctx.stream);
+    let (ai_ptr, _gai) = a_inv.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_solve_cuda(
+            a_ptr as *const f32,
+            ai_ptr as *mut ffi::Half,
+            seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+fn gated_delta_rule_prefill_chunk_recompute_into(
+    ctx: &DeviceContext,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    beta: &CudaSlice<f32>,
+    w: &mut HiddenStates,
+    u: &mut HiddenStates,
+    a_inv: &CudaSlice<half::bf16>,
+    g_cumsum: &CudaSlice<f32>,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (beta_ptr, _gb) = beta.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = w.data.device_ptr_mut(&ctx.stream);
+    let (u_ptr, _gu) = u.data.device_ptr_mut(&ctx.stream);
+    let (ai_ptr, _gai) = a_inv.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = g_cumsum.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_recompute_cuda(
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            beta_ptr as *const f32,
+            w_ptr as *mut ffi::Half,
+            u_ptr as *mut ffi::Half,
+            ai_ptr as *const ffi::Half,
+            g_ptr as *const f32,
+            k.seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn gated_delta_rule_prefill_chunk_state_stage_into(
+    ctx: &DeviceContext,
+    k: &HiddenStates,
+    w: &HiddenStates,
+    u: &HiddenStates,
+    g_cumsum: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    chunk_state: &mut CudaSlice<f32>,
+    v_new: &mut HiddenStates,
+    num_value_heads: usize,
+) -> Result<()> {
+    assert_eq!(k.hidden_dim, w.hidden_dim);
+    assert_eq!(u.hidden_dim, v_new.hidden_dim);
+    assert_eq!(k.seq_len, w.seq_len);
+    assert_eq!(k.seq_len, u.seq_len);
+    assert_eq!(k.seq_len, v_new.seq_len);
+
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (u_ptr, _gu) = u.data.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = g_cumsum.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
+    let (cs_ptr, _gcs) = chunk_state.device_ptr_mut(&ctx.stream);
+    let (vn_ptr, _gvn) = v_new.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_state_cuda(
+            k_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            u_ptr as *const ffi::Half,
+            g_ptr as *const f32,
+            s_ptr as *const f32,
+            cs_ptr as *mut f32,
+            vn_ptr as *mut ffi::Half,
+            s_ptr as *mut f32,
+            k.seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn gated_delta_rule_prefill_chunk_o_stage_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v_new: &HiddenStates,
+    chunk_state: &CudaSlice<f32>,
+    g_cumsum: &CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_value_heads: usize,
+    scale: f32,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, k.hidden_dim);
+    assert_eq!(v_new.hidden_dim, output.hidden_dim);
+    assert_eq!(q.seq_len, k.seq_len);
+    assert_eq!(q.seq_len, v_new.seq_len);
+    assert_eq!(q.seq_len, output.seq_len);
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (vn_ptr, _gvn) = v_new.data.device_ptr(&ctx.stream);
+    let (cs_ptr, _gcs) = chunk_state.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = g_cumsum.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_o_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            vn_ptr as *const ffi::Half,
+            cs_ptr as *const f32,
+            g_ptr as *const f32,
+            o_ptr as *mut ffi::Half,
+            q.seq_len as i32,
+            num_value_heads as i32,
+            scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
+/// Chunk-wise GDR prefill operator contract for Qwen3.5.
+///
+/// The chunk-wise path is an explicit multi-stage operator with pre-allocated
+/// scratch instead of one opaque kernel launch.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_rule_prefill_chunkwise_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    scratch: &mut GdrChunkwiseScratch35,
+    output: &mut HiddenStates,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> Result<()> {
+    assert_eq!(scratch.q_expanded.seq_len, qkv.seq_len);
+    assert_eq!(scratch.k_expanded.seq_len, qkv.seq_len);
+    assert_eq!(scratch.v_raw.seq_len, qkv.seq_len);
+    assert_eq!(scratch.w.seq_len, qkv.seq_len);
+    assert_eq!(scratch.u.seq_len, qkv.seq_len);
+    assert_eq!(scratch.v_new.seq_len, qkv.seq_len);
+    assert_eq!(scratch.q_expanded.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.k_expanded.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.v_raw.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(scratch.w.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.u.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(scratch.v_new.hidden_dim, num_value_heads * val_dim);
+
+    let expected_gate_len = qkv.seq_len * num_value_heads;
+    let expected_chunk_a_len = qkv.seq_len * num_value_heads * GdrChunkwiseScratch35::CHUNK_SIZE;
+    let expected_chunk_ai_len = expected_chunk_a_len;
+    let expected_chunk_state_len =
+        GdrChunkwiseScratch35::num_chunks(qkv.seq_len) * num_value_heads * val_dim * key_dim;
+    assert_eq!(scratch.g_cumsum.len(), expected_gate_len);
+    assert_eq!(scratch.beta.len(), expected_gate_len);
+    assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);
+    assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
+    assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
+
+    gated_delta_rule_prefill_chunk_prepare_into(
+        ctx,
+        qkv,
+        b_proj,
+        a_proj,
+        dt_bias,
+        a_log,
+        &mut scratch.q_expanded,
+        &mut scratch.k_expanded,
+        &mut scratch.v_raw,
+        &mut scratch.g_cumsum,
+        &mut scratch.beta,
+        num_key_heads,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_cumsum_inplace(
+        ctx,
+        &mut scratch.g_cumsum,
+        qkv.seq_len,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_a_into(
+        ctx,
+        &scratch.k_expanded,
+        &scratch.g_cumsum,
+        &scratch.beta,
+        &mut scratch.a_tril,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_solve_into(
+        ctx,
+        &scratch.a_tril,
+        &mut scratch.a_inv,
+        qkv.seq_len,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_recompute_into(
+        ctx,
+        &scratch.k_expanded,
+        &scratch.v_raw,
+        &scratch.beta,
+        &mut scratch.w,
+        &mut scratch.u,
+        &scratch.a_inv,
+        &scratch.g_cumsum,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_state_stage_into(
+        ctx,
+        &scratch.k_expanded,
+        &scratch.w,
+        &scratch.u,
+        &scratch.g_cumsum,
+        state,
+        &mut scratch.chunk_state,
+        &mut scratch.v_new,
+        num_value_heads,
+    )?;
+    gated_delta_rule_prefill_chunk_o_stage_into(
+        ctx,
+        &scratch.q_expanded,
+        &scratch.k_expanded,
+        &scratch.v_new,
+        &scratch.chunk_state,
+        &scratch.g_cumsum,
+        output,
+        num_value_heads,
+        1.0 / (key_dim as f32).sqrt(),
+    )
+}
+
 /// Fused GQA Attention HD256 — decode variant (reads pos/seq_len from decode_meta).
 /// q_full: interleaved [head0_q(256), head0_gate(256), head1_q(256), ...] = [num_qheads * 2 * 256]
 /// Output already gated: output *= sigmoid(gate).
@@ -1209,66 +1834,6 @@ pub fn fused_attention_hd256_decode_into(
             num_qheads as i32,
             num_kvheads as i32,
             (num_qheads / num_kvheads) as i32,
-            rotary_dim as i32,
-            scale,
-            rms_eps,
-            ctx.stream.cu_stream(),
-        );
-    }
-
-    Ok(())
-}
-
-/// Fused GQA Attention HD256 — single token variant (scalar pos/seq_len, for prefill).
-#[allow(clippy::too_many_arguments)]
-pub fn fused_attention_hd256_single_token_into(
-    ctx: &DeviceContext,
-    q_full: &DeviceVec,
-    k_full: &DeviceVec,
-    v_full: &DeviceVec,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_pos: &DeviceVecView<'_>,
-    sin_pos: &DeviceVecView<'_>,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    output: &mut DeviceVec,
-    num_qheads: usize,
-    num_kvheads: usize,
-    current_pos: usize,
-    seq_len: usize,
-    rotary_dim: usize,
-    scale: f32,
-    rms_eps: f32,
-) -> Result<()> {
-    let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
-    let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
-    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gc) = cos_pos.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gs) = sin_pos.data.device_ptr(&ctx.stream);
-    let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-    let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::fused_gqa_attention_hd256_single_token(
-            q_ptr as *const ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            kc_ptr as *mut ffi::Half,
-            vc_ptr as *mut ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_qheads as i32,
-            num_kvheads as i32,
-            (num_qheads / num_kvheads) as i32,
-            current_pos as i32,
-            seq_len as i32,
             rotary_dim as i32,
             scale,
             rms_eps,
@@ -1813,6 +2378,466 @@ mod tests {
         };
         let token = gpu_sample(&ctx, &logits, &mut probs, &params, 0.5)?;
         assert_eq!(token, 2, "top_k=1 should pick highest probability token");
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_qheads = 4;
+        let num_kvheads = 1;
+        let head_dim = 256;
+        let q_dim = num_qheads * head_dim;
+        let gqa_ratio = num_qheads / num_kvheads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        for (start_pos, seq_len) in [(0_usize, 1_usize), (0, 6), (3, 6)] {
+            let total_seq = start_pos + seq_len;
+            let q_host_bf16 = bf16_vec(
+                &(0..q_dim * seq_len)
+                    .map(|i| ((i % 41) as f32 - 20.0) * 0.0625)
+                    .collect::<Vec<_>>(),
+            );
+            let q_host: Vec<f32> = q_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let cache_len = num_kvheads * 4096 * head_dim;
+            let mut k_cache_host_bf16 = vec![bf16::ZERO; cache_len];
+            let mut v_cache_host_bf16 = vec![bf16::ZERO; cache_len];
+            for kv_head in 0..num_kvheads {
+                for pos in 0..total_seq {
+                    let base = (kv_head * 4096 + pos) * head_dim;
+                    for dim in 0..head_dim {
+                        let k_val = (((kv_head * 31 + pos * 7 + dim) % 67) as f32 - 33.0) * 0.03125;
+                        let v_val = (((kv_head * 19 + pos * 5 + dim) % 59) as f32 - 29.0) * 0.03125;
+                        k_cache_host_bf16[base + dim] = bf16::from_f32(k_val);
+                        v_cache_host_bf16[base + dim] = bf16::from_f32(v_val);
+                    }
+                }
+            }
+            let k_cache_host: Vec<f32> = k_cache_host_bf16.iter().map(|x| x.to_f32()).collect();
+            let v_cache_host: Vec<f32> = v_cache_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let q_batch = HiddenStates {
+                data: ctx.stream.clone_htod(&q_host_bf16)?,
+                hidden_dim: q_dim,
+                seq_len,
+            };
+            let k_cache = DeviceVec::from_host(&ctx, &k_cache_host_bf16)?;
+            let v_cache = DeviceVec::from_host(&ctx, &v_cache_host_bf16)?;
+            let mut out = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
+
+            flash_attention_prefill_hd256_into(
+                &ctx,
+                &q_batch,
+                &k_cache,
+                &v_cache,
+                &mut out,
+                num_qheads,
+                num_kvheads,
+                start_pos,
+            )?;
+
+            let out_host_bf16 = ctx.stream.clone_dtoh(&out.data)?;
+            ctx.sync()?;
+            let out_host: Vec<f32> = out_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let mut ref_out = vec![0.0_f32; q_dim * seq_len];
+            for token in 0..seq_len {
+                let causal_end = start_pos + token;
+                for q_head in 0..num_qheads {
+                    let kv_head = q_head / gqa_ratio;
+                    let q_base = token * q_dim + q_head * head_dim;
+                    let q_slice = &q_host[q_base..q_base + head_dim];
+
+                    let mut scores = vec![0.0_f32; causal_end + 1];
+                    for (pos, score) in scores.iter_mut().enumerate() {
+                        let k_base = (kv_head * 4096 + pos) * head_dim;
+                        *score = (0..head_dim)
+                            .map(|dim| q_slice[dim] * k_cache_host[k_base + dim])
+                            .sum::<f32>()
+                            * scale;
+                    }
+
+                    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exp_scores: Vec<f32> =
+                        scores.iter().map(|x| (x - max_score).exp()).collect();
+                    let sum_exp = exp_scores.iter().sum::<f32>();
+                    let probs: Vec<f32> = exp_scores.iter().map(|x| x / sum_exp).collect();
+
+                    for dim in 0..head_dim {
+                        let mut acc = 0.0_f32;
+                        for (pos, prob) in probs.iter().enumerate() {
+                            let v_base = (kv_head * 4096 + pos) * head_dim;
+                            acc += prob * v_cache_host[v_base + dim];
+                        }
+                        ref_out[q_base + dim] = acc;
+                    }
+                }
+            }
+
+            let max_out_diff = out_host
+                .iter()
+                .zip(ref_out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_out_diff < 0.1,
+                "start_pos={start_pos} seq_len={seq_len} output diff {max_out_diff}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_prefill_attention_hd256_batch_matches_cpu_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_qheads = 4;
+        let num_kvheads = 1;
+        let head_dim = 256;
+        let rotary_dim = 64;
+        let q_dim = num_qheads * head_dim;
+        let q_full_dim = q_dim * 2;
+        let kv_dim = num_kvheads * head_dim;
+        let gqa_ratio = num_qheads / num_kvheads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let eps = 1e-6_f32;
+
+        let q_weight_host_bf16: Vec<bf16> = (0..head_dim)
+            .map(|idx| bf16::from_f32(0.5 + (idx % 23) as f32 * 0.03125))
+            .collect();
+        let k_weight_host_bf16: Vec<bf16> = (0..head_dim)
+            .map(|idx| bf16::from_f32(0.5 + (idx % 19) as f32 * 0.03125))
+            .collect();
+        let q_weight_host: Vec<f32> = q_weight_host_bf16.iter().map(|x| x.to_f32()).collect();
+        let k_weight_host: Vec<f32> = k_weight_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+        let half_rotary = rotary_dim / 2;
+        let theta = 10_000_000.0_f32;
+        let inv_freq: Vec<f32> = (0..half_rotary)
+            .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / rotary_dim as f32))
+            .collect();
+        let mut cos_host = vec![bf16::ZERO; 4096 * rotary_dim];
+        let mut sin_host = vec![bf16::ZERO; 4096 * rotary_dim];
+        for pos in 0..4096 {
+            for i in 0..half_rotary {
+                let freq = pos as f32 * inv_freq[i];
+                let cos = bf16::from_f32(freq.cos());
+                let sin = bf16::from_f32(freq.sin());
+                cos_host[pos * rotary_dim + i] = cos;
+                cos_host[pos * rotary_dim + i + half_rotary] = cos;
+                sin_host[pos * rotary_dim + i] = sin;
+                sin_host[pos * rotary_dim + i + half_rotary] = sin;
+            }
+        }
+
+        let rms_norm_offset = |x: &[f32], weight: &[f32]| -> Vec<f32> {
+            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            x.iter()
+                .zip(weight.iter())
+                .map(|(v, w)| v * inv * (1.0 + w))
+                .collect()
+        };
+
+        let apply_partial_rope = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut out = x.to_vec();
+            for i in 0..half_rotary {
+                let cos = cos_host[pos * rotary_dim + i].to_f32();
+                let sin = sin_host[pos * rotary_dim + i].to_f32();
+                let lo = x[i];
+                let hi = x[i + half_rotary];
+                out[i] = lo * cos - hi * sin;
+                out[i + half_rotary] = lo * sin + hi * cos;
+            }
+            out
+        };
+
+        for (start_pos, seq_len) in [(0_usize, 1_usize), (0, 6), (3, 6)] {
+            let q_full_host_bf16 = bf16_vec(
+                &(0..q_full_dim * seq_len)
+                    .map(|i| ((i % 73) as f32 - 36.0) * 0.03125)
+                    .collect::<Vec<_>>(),
+            );
+            let q_full_host: Vec<f32> = q_full_host_bf16.iter().map(|x| x.to_f32()).collect();
+            let k_batch_host_bf16 = bf16_vec(
+                &(0..kv_dim * seq_len)
+                    .map(|i| ((i % 61) as f32 - 30.0) * 0.03125)
+                    .collect::<Vec<_>>(),
+            );
+            let v_batch_host_bf16 = bf16_vec(
+                &(0..kv_dim * seq_len)
+                    .map(|i| ((i % 67) as f32 - 33.0) * 0.03125)
+                    .collect::<Vec<_>>(),
+            );
+            let k_batch_host: Vec<f32> = k_batch_host_bf16.iter().map(|x| x.to_f32()).collect();
+            let v_batch_host: Vec<f32> = v_batch_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let cache_len = num_kvheads * 4096 * head_dim;
+            let mut k_cache_init_bf16 = vec![bf16::ZERO; cache_len];
+            let mut v_cache_init_bf16 = vec![bf16::ZERO; cache_len];
+            for pos in 0..start_pos {
+                let base = pos * head_dim;
+                for dim in 0..head_dim {
+                    k_cache_init_bf16[base + dim] =
+                        bf16::from_f32(((pos * 11 + dim) % 43) as f32 * 0.05 - 1.0);
+                    v_cache_init_bf16[base + dim] =
+                        bf16::from_f32(((pos * 7 + dim) % 47) as f32 * 0.04 - 0.8);
+                }
+            }
+            let mut ref_k_cache: Vec<f32> = k_cache_init_bf16.iter().map(|x| x.to_f32()).collect();
+            let mut ref_v_cache: Vec<f32> = v_cache_init_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let q_full_batch = HiddenStates {
+                data: ctx.stream.clone_htod(&q_full_host_bf16)?,
+                hidden_dim: q_full_dim,
+                seq_len,
+            };
+            let k_batch = HiddenStates {
+                data: ctx.stream.clone_htod(&k_batch_host_bf16)?,
+                hidden_dim: kv_dim,
+                seq_len,
+            };
+            let v_batch = HiddenStates {
+                data: ctx.stream.clone_htod(&v_batch_host_bf16)?,
+                hidden_dim: kv_dim,
+                seq_len,
+            };
+            let q_weight = DeviceVec::from_host(&ctx, &q_weight_host_bf16)?;
+            let k_weight = DeviceVec::from_host(&ctx, &k_weight_host_bf16)?;
+            let cos_cache = DeviceVec::from_host(&ctx, &cos_host)?;
+            let sin_cache = DeviceVec::from_host(&ctx, &sin_host)?;
+            let mut k_cache = DeviceVec::from_host(&ctx, &k_cache_init_bf16)?;
+            let mut v_cache = DeviceVec::from_host(&ctx, &v_cache_init_bf16)?;
+            let mut out = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
+
+            prefill_attention_hd256_batch(
+                &ctx,
+                &q_full_batch,
+                &k_batch,
+                &v_batch,
+                &q_weight,
+                &k_weight,
+                &cos_cache,
+                &sin_cache,
+                &mut k_cache,
+                &mut v_cache,
+                &mut out,
+                num_qheads,
+                num_kvheads,
+                start_pos,
+                rotary_dim,
+                eps,
+            )?;
+
+            let out_host_bf16 = ctx.stream.clone_dtoh(&out.data)?;
+            let got_k_cache = k_cache.to_host(&ctx)?;
+            let got_v_cache = v_cache.to_host(&ctx)?;
+            let out_host: Vec<f32> = out_host_bf16.iter().map(|x| x.to_f32()).collect();
+
+            let mut ref_out = vec![0.0_f32; q_dim * seq_len];
+            for token in 0..seq_len {
+                let pos = start_pos + token;
+
+                for kv_head in 0..num_kvheads {
+                    let k_base = token * kv_dim + kv_head * head_dim;
+                    let k_head = &k_batch_host[k_base..k_base + head_dim];
+                    let k_normed = rms_norm_offset(k_head, &k_weight_host);
+                    let k_rot = apply_partial_rope(&k_normed, pos);
+                    let cache_base = (kv_head * 4096 + pos) * head_dim;
+                    ref_k_cache[cache_base..cache_base + head_dim].copy_from_slice(&k_rot);
+                    ref_v_cache[cache_base..cache_base + head_dim]
+                        .copy_from_slice(&v_batch_host[k_base..k_base + head_dim]);
+                }
+
+                for q_head in 0..num_qheads {
+                    let q_base = token * q_full_dim + q_head * 2 * head_dim;
+                    let q_head_slice = &q_full_host[q_base..q_base + head_dim];
+                    let gate_slice = &q_full_host[q_base + head_dim..q_base + 2 * head_dim];
+                    let q_normed = rms_norm_offset(q_head_slice, &q_weight_host);
+                    let q_rot = apply_partial_rope(&q_normed, pos);
+                    let kv_head = q_head / gqa_ratio;
+
+                    let mut scores = vec![0.0_f32; pos + 1];
+                    for (cache_pos, score) in scores.iter_mut().enumerate() {
+                        let k_base = (kv_head * 4096 + cache_pos) * head_dim;
+                        *score = (0..head_dim)
+                            .map(|dim| q_rot[dim] * ref_k_cache[k_base + dim])
+                            .sum::<f32>()
+                            * scale;
+                    }
+                    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exp_scores: Vec<f32> =
+                        scores.iter().map(|x| (x - max_score).exp()).collect();
+                    let sum_exp = exp_scores.iter().sum::<f32>();
+                    let probs: Vec<f32> = exp_scores.iter().map(|x| x / sum_exp).collect();
+
+                    let out_base = token * q_dim + q_head * head_dim;
+                    for dim in 0..head_dim {
+                        let mut acc = 0.0_f32;
+                        for (cache_pos, prob) in probs.iter().enumerate() {
+                            let v_base = (kv_head * 4096 + cache_pos) * head_dim;
+                            acc += prob * ref_v_cache[v_base + dim];
+                        }
+                        let sig_gate = 1.0 / (1.0 + (-gate_slice[dim]).exp());
+                        ref_out[out_base + dim] = acc * sig_gate;
+                    }
+                }
+            }
+
+            let max_k_diff = (0..num_kvheads * (start_pos + seq_len) * head_dim)
+                .map(|idx| (got_k_cache[idx] - ref_k_cache[idx]).abs())
+                .fold(0.0_f32, f32::max);
+            let max_v_diff = (0..num_kvheads * (start_pos + seq_len) * head_dim)
+                .map(|idx| (got_v_cache[idx] - ref_v_cache[idx]).abs())
+                .fold(0.0_f32, f32::max);
+            let max_out_diff = out_host
+                .iter()
+                .zip(ref_out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            assert!(
+                max_k_diff < 0.05,
+                "start_pos={start_pos} seq_len={seq_len} k_cache diff {max_k_diff}"
+            );
+            assert!(
+                max_v_diff < 0.02,
+                "start_pos={start_pos} seq_len={seq_len} v_cache diff {max_v_diff}"
+            );
+            assert!(
+                max_out_diff < 0.12,
+                "start_pos={start_pos} seq_len={seq_len} output diff {max_out_diff}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gated_delta_rule_prefill_chunkwise_matches_decode_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_key_heads = 2usize;
+        let num_value_heads = 4usize;
+        let key_dim = 128usize;
+        let val_dim = 128usize;
+        let seq_len = 5usize;
+        let qkv_dim = num_key_heads * key_dim * 2 + num_value_heads * val_dim;
+        let out_dim = num_value_heads * val_dim;
+        let state_len = num_value_heads * key_dim * val_dim;
+
+        let qkv_host = bf16_vec(
+            &(0..qkv_dim * seq_len)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let b_host = bf16_vec(
+            &(0..num_value_heads * seq_len)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.125)
+                .collect::<Vec<_>>(),
+        );
+        let a_host = bf16_vec(
+            &(0..num_value_heads * seq_len)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.09375)
+                .collect::<Vec<_>>(),
+        );
+        let dt_bias_host = bf16_vec(
+            &(0..num_value_heads)
+                .map(|i| 0.2 + i as f32 * 0.05)
+                .collect::<Vec<_>>(),
+        );
+        let a_log_host: Vec<f32> = (0..num_value_heads)
+            .map(|i| -1.5 + i as f32 * 0.125)
+            .collect();
+        let state_init_host: Vec<f32> = (0..state_len)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.002)
+            .collect();
+
+        let qkv = HiddenStates {
+            data: ctx.stream.clone_htod(&qkv_host)?,
+            hidden_dim: qkv_dim,
+            seq_len,
+        };
+        let b_proj = HiddenStates {
+            data: ctx.stream.clone_htod(&b_host)?,
+            hidden_dim: num_value_heads,
+            seq_len,
+        };
+        let a_proj = HiddenStates {
+            data: ctx.stream.clone_htod(&a_host)?,
+            hidden_dim: num_value_heads,
+            seq_len,
+        };
+        let dt_bias = DeviceVec::from_host(&ctx, &dt_bias_host)?;
+        let a_log = ctx.stream.clone_htod(&a_log_host)?;
+
+        let mut state_prefill = ctx.stream.clone_htod(&state_init_host)?;
+        let mut out_prefill = HiddenStates::zeros(&ctx, out_dim, seq_len)?;
+        let mut scratch =
+            GdrChunkwiseScratch35::from_dims(&ctx, num_value_heads, key_dim, val_dim, seq_len)?;
+        gated_delta_rule_prefill_chunkwise_into(
+            &ctx,
+            &qkv,
+            &b_proj,
+            &a_proj,
+            &dt_bias,
+            &a_log,
+            &mut state_prefill,
+            &mut scratch,
+            &mut out_prefill,
+            num_key_heads,
+            num_value_heads,
+            key_dim,
+            val_dim,
+        )?;
+
+        let mut state_decode = ctx.stream.clone_htod(&state_init_host)?;
+        let mut out_decode = HiddenStates::zeros(&ctx, out_dim, seq_len)?;
+        for t in 0..seq_len {
+            let qkv_t = extract_vec(&ctx, &qkv, t)?;
+            let b_t = extract_vec(&ctx, &b_proj, t)?;
+            let a_t = extract_vec(&ctx, &a_proj, t)?;
+            let mut out_t = DeviceVec::zeros(&ctx, out_dim)?;
+            gated_delta_rule_decode_into(
+                &ctx,
+                &qkv_t,
+                &b_t,
+                &a_t,
+                &dt_bias,
+                &a_log,
+                &mut state_decode,
+                &mut out_t,
+                num_key_heads,
+                num_value_heads,
+                key_dim,
+                val_dim,
+            )?;
+            write_vec(&ctx, &mut out_decode, t, &out_t)?;
+        }
+
+        let out_prefill_host = ctx.stream.clone_dtoh(&out_prefill.data)?;
+        let out_decode_host = ctx.stream.clone_dtoh(&out_decode.data)?;
+        let state_prefill_host = ctx.stream.clone_dtoh(&state_prefill)?;
+        let state_decode_host = ctx.stream.clone_dtoh(&state_decode)?;
+        ctx.sync()?;
+
+        let max_out_diff = out_prefill_host
+            .iter()
+            .zip(out_decode_host.iter())
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .fold(0.0_f32, f32::max);
+        let max_state_diff = state_prefill_host
+            .iter()
+            .zip(state_decode_host.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_out_diff < 0.05, "output diff {max_out_diff}");
+        assert!(max_state_diff < 0.01, "state diff {max_state_diff}");
 
         Ok(())
     }
