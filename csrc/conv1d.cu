@@ -3,59 +3,10 @@
 // ============================================================================
 // Causal Depthwise Conv1d for Gated Delta Net linear attention
 //
-// Decode: Single-step update per channel.
-//   conv_state[c, 0..(K-2)] stores the last (K-1) inputs.
-//   On each step: shift state left, append new input, compute dot product, SiLU.
-//
 // Prefill: Parallel causal conv1d over the entire sequence.
 // ============================================================================
 
 #define CONV1D_BLOCK 256
-
-// ============================================================================
-// Decode kernel: one thread per channel
-// conv_state: [num_channels, K-1] bf16, row-major
-// conv_weight: [num_channels, K] bf16, flattened from [num_channels, 1, K]
-// x: [num_channels] bf16 (current step input)
-// out: [num_channels] bf16 (output after conv + SiLU)
-// ============================================================================
-__global__ void conv1d_decode_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ conv_weight,
-    __nv_bfloat16* __restrict__ conv_state,
-    __nv_bfloat16* __restrict__ out,
-    int num_channels,
-    int kernel_size  // K=4
-) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= num_channels) return;
-
-    int state_width = kernel_size - 1;  // 3
-
-    // Read current state values and new input
-    // State layout: [c * state_width + 0..state_width-1]
-    float vals[4];  // max kernel_size=4
-    for (int i = 0; i < state_width; i++) {
-        vals[i] = __bfloat162float(conv_state[c * state_width + i]);
-    }
-    vals[state_width] = __bfloat162float(x[c]);
-
-    // Compute convolution dot product
-    float sum = 0.0f;
-    for (int i = 0; i < kernel_size; i++) {
-        sum += vals[i] * __bfloat162float(conv_weight[c * kernel_size + i]);
-    }
-
-    // SiLU activation
-    float silu_out = sum / (1.0f + expf(-sum));
-    out[c] = __float2bfloat16(silu_out);
-
-    // Update state: shift left, append new input
-    for (int i = 0; i < state_width - 1; i++) {
-        conv_state[c * state_width + i] = __float2bfloat16(vals[i + 1]);
-    }
-    conv_state[c * state_width + state_width - 1] = x[c];
-}
 
 // ============================================================================
 // Prefill kernel: parallel causal conv1d over sequence
@@ -102,38 +53,32 @@ __global__ void conv1d_prefill_kernel(
         sum += val * __bfloat162float(conv_weight[c * kernel_size + k]);
     }
 
-    // SiLU
-    float silu_out = sum / (1.0f + expf(-sum));
+    // Match HF/PyTorch: conv1d writes bf16, then SiLU consumes bf16 input.
+    float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
+    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_seq[t * num_channels + c] = __float2bfloat16(silu_out);
 
     // Last (state_width) tokens update conv_state
     // Only the last thread for each channel updates state
     if (t == seq_len - 1) {
+        float old_state[4];
+        for (int i = 0; i < state_width; i++) {
+            old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
+        }
         for (int i = 0; i < state_width; i++) {
             int src_t = seq_len - state_width + i;
             if (src_t >= 0) {
                 conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
+            } else {
+                int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
+                conv_state[c * state_width + i] =
+                    state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
             }
         }
     }
 }
 
 extern "C" {
-
-void conv1d_decode_cuda(
-    const __nv_bfloat16* x,
-    const __nv_bfloat16* conv_weight,
-    __nv_bfloat16* conv_state,
-    __nv_bfloat16* out,
-    int num_channels,
-    int kernel_size,
-    cudaStream_t stream
-) {
-    int blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
-    conv1d_decode_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
-        x, conv_weight, conv_state, out, num_channels, kernel_size
-    );
-}
 
 void conv1d_prefill_cuda(
     const __nv_bfloat16* x_seq,
