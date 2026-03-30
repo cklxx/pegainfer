@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use fastrace::local::LocalSpan;
-use log::debug;
+use log::{debug, info};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
@@ -354,6 +354,53 @@ pub struct GenericServerEngine<M: ModelForward> {
     state: M::State,
     tokenizer: Tokenizer,
     rng: StdRng,
+    /// Cached prompt tokens from the last request for prefix reuse.
+    cached_prompt: Vec<u32>,
+}
+
+impl<M: ModelForward> GenericServerEngine<M> {
+    /// Prepare state for a new request, reusing cached KV prefix where possible.
+    /// Returns the tokens that still need to be processed (the non-cached suffix).
+    fn prepare_with_prefix_cache(&mut self, prompt_tokens: &[u32]) -> Result<(Vec<u32>, usize)> {
+        let prefix_len = self
+            .cached_prompt
+            .iter()
+            .zip(prompt_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        if prefix_len > 0 && prefix_len == self.cached_prompt.len() {
+            // Cached prompt is a prefix of the new prompt — reuse KV cache.
+            // KV cache already has entries for cached_prompt[..prefix_len].
+            // Only need to prefill prompt_tokens[prefix_len..].
+            let suffix = prompt_tokens[prefix_len..].to_vec();
+            info!(
+                "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
+                prefix_len,
+                prompt_tokens.len(),
+                prefix_len as f64 / prompt_tokens.len() as f64 * 100.0
+            );
+            Ok((suffix, prefix_len))
+        } else if prefix_len > 0 && prefix_len < self.cached_prompt.len() {
+            // Cached prompt diverges — the KV cache contains entries beyond the
+            // common prefix that are now invalid. We must reset and re-prefill.
+            info!(
+                "KV prefix cache PARTIAL: common={}, cached={}, new={} — resetting",
+                prefix_len,
+                self.cached_prompt.len(),
+                prompt_tokens.len()
+            );
+            self.state.reset()?;
+            self.cached_prompt.clear();
+            Ok((prompt_tokens.to_vec(), 0))
+        } else {
+            // No prefix match — full reset.
+            info!("KV prefix cache MISS: resetting");
+            self.state.reset()?;
+            self.cached_prompt.clear();
+            Ok((prompt_tokens.to_vec(), 0))
+        }
+    }
 }
 
 impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
@@ -363,19 +410,30 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        self.state.reset()?;
+        let (tokens_to_process, _prefix_len) =
+            self.prepare_with_prefix_cache(&prompt_tokens)?;
+        // tokens_to_process is the suffix that still needs prefill.
+        // If empty (full cache hit), use just the last token to get logits.
+        let effective = if tokens_to_process.is_empty() {
+            vec![*prompt_tokens.last().unwrap()]
+        } else {
+            tokens_to_process
+        };
         let output_tokens = generate(
             &self.model,
             &mut self.state,
-            &prompt_tokens,
+            &effective,
             req.max_tokens,
             &req.sampling,
             &mut self.rng,
         )?;
-        let completion_tokens = output_tokens.len().saturating_sub(prompt_tokens.len());
+        // Update cached prompt for prefix reuse on next request
+        self.cached_prompt = prompt_tokens.clone();
+        // output_tokens = effective_prompt + generated tokens
+        let completion_tokens = output_tokens.len().saturating_sub(effective.len());
         let mut text = self
             .tokenizer
-            .decode(&output_tokens[prompt_tokens.len()..])?;
+            .decode(&output_tokens[effective.len()..])?;
         let mut finish_reason = if completion_tokens >= req.max_tokens {
             FinishReason::Length
         } else {
@@ -405,7 +463,13 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        self.state.reset()?;
+        let (tokens_to_process, _prefix_len) =
+            self.prepare_with_prefix_cache(&prompt_tokens)?;
+        let effective_prompt = if tokens_to_process.is_empty() {
+            vec![*prompt_tokens.last().unwrap()]
+        } else {
+            tokens_to_process
+        };
         let mut decoder = self.tokenizer.incremental_decoder();
         let mut decode_error = None;
         let stops: Option<Vec<&str>> = req.stop.as_ref().map(|v| {
@@ -420,7 +484,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         let stats = generate_streaming_with_callback(
             &self.model,
             &mut self.state,
-            &prompt_tokens,
+            &effective_prompt,
             req.max_tokens,
             &req.sampling,
             &mut self.rng,
@@ -530,6 +594,9 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             }),
         });
 
+        // Update cached prompt for prefix reuse on next request
+        self.cached_prompt = prompt_tokens;
+
         Ok(())
     }
 }
@@ -570,6 +637,7 @@ impl RealServerEngine {
             state,
             tokenizer,
             rng,
+            cached_prompt: Vec::new(),
         })
     }
 
@@ -591,6 +659,7 @@ impl Qwen35ServerEngine {
             state,
             tokenizer,
             rng,
+            cached_prompt: Vec::new(),
         })
     }
 
