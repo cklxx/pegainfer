@@ -39,6 +39,16 @@ impl GenerationState for Qwen35State {
         self.prefill_logits = None;
         Ok(())
     }
+
+    fn truncate_to(&mut self, len: usize) -> Result<()> {
+        self.kv_cache.truncate_to(len);
+        self.graph_state = CudaGraphState::new();
+        self.prefill_logits = None;
+        // Note: recurrent_state for Qwen3.5 linear layers cannot be truncated
+        // (it's a running state, not positional). Reset it on truncation.
+        self.recurrent_state.reset(&self.ctx)?;
+        Ok(())
+    }
 }
 
 impl ModelForward for Qwen35Model {
@@ -60,6 +70,11 @@ impl ModelForward for Qwen35Model {
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        // Prefetch offloaded KV from CPU to GPU before computation.
+        if state.kv_cache.has_offloaded() {
+            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        }
+
         if tokens.len() == 1 {
             self.prefill_forward_single_token(
                 tokens[0],
@@ -74,6 +89,10 @@ impl ModelForward for Qwen35Model {
                 self.prefill_forward(tokens, &mut state.kv_cache, &mut state.recurrent_state)?;
             state.prefill_logits = Some(logits);
         }
+
+        // Offload excess KV to CPU if over GPU budget.
+        state.kv_cache.offload_if_needed(&self.ctx)?;
+
         Ok(())
     }
 

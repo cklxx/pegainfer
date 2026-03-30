@@ -23,6 +23,9 @@ pub use qwen35::{Qwen35Model, Qwen35State};
 pub trait GenerationState {
     fn logits(&self) -> &DeviceVec;
     fn reset(&mut self) -> Result<()>;
+    /// Truncate KV cache to `len` tokens, keeping the first `len` tokens.
+    /// Used for partial prefix reuse.
+    fn truncate_to(&mut self, len: usize) -> Result<()>;
 }
 
 /// Deep module interface: one `forward` method hides prefill/decode strategy,

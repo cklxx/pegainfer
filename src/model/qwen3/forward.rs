@@ -34,6 +34,14 @@ impl GenerationState for Qwen3State {
     fn reset(&mut self) -> Result<()> {
         self.kv_cache.reset();
         self.prefill_logits = None;
+        self.graph_state = CudaGraphState::new(); // Invalidate CUDA graph
+        Ok(())
+    }
+
+    fn truncate_to(&mut self, len: usize) -> Result<()> {
+        self.kv_cache.truncate_to(len);
+        self.prefill_logits = None;
+        self.graph_state = CudaGraphState::new(); // Invalidate CUDA graph
         Ok(())
     }
 }
@@ -54,6 +62,11 @@ impl ModelForward for Qwen3Model {
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        // If KV data was offloaded to CPU, prefetch it back to GPU before computation.
+        if state.kv_cache.has_offloaded() {
+            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        }
+
         if tokens.len() == 1 {
             self.decode_one_token(
                 tokens[0],
@@ -69,6 +82,10 @@ impl ModelForward for Qwen3Model {
             let logits = self.compute_logits_batch(&hidden)?;
             state.prefill_logits = Some(logits);
         }
+
+        // After computation, offload excess KV to CPU if GPU is over budget.
+        state.kv_cache.offload_if_needed(&self.ctx)?;
+
         Ok(())
     }
 

@@ -94,6 +94,94 @@ impl DeviceVec {
         })
     }
 
+    /// Copy a region of the device buffer to a host slice (D2H).
+    ///
+    /// `offset` and `len` are in elements (bf16), not bytes.
+    /// `dst` must have length >= `len`.
+    pub fn copy_region_to_host(
+        &self,
+        ctx: &DeviceContext,
+        offset: usize,
+        len: usize,
+        dst: &mut [bf16],
+    ) -> Result<()> {
+        assert!(
+            offset + len <= self.len,
+            "copy_region_to_host: offset {} + len {} exceeds buffer len {}",
+            offset,
+            len,
+            self.len
+        );
+        assert!(
+            dst.len() >= len,
+            "copy_region_to_host: dst len {} < requested len {}",
+            dst.len(),
+            len
+        );
+        let view = self.data.slice(offset..offset + len);
+        ctx.stream
+            .memcpy_dtoh(&view, &mut dst[..len])
+            .map_err(|e| anyhow!("D2H region copy failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Copy from a host slice into a region of the device buffer (H2D).
+    ///
+    /// `offset` is in elements (bf16). `src.len()` elements are copied
+    /// starting at `offset` in the device buffer.
+    pub fn copy_region_from_host(
+        &mut self,
+        ctx: &DeviceContext,
+        offset: usize,
+        src: &[bf16],
+    ) -> Result<()> {
+        assert!(
+            offset + src.len() <= self.len,
+            "copy_region_from_host: offset {} + src len {} exceeds buffer len {}",
+            offset,
+            src.len(),
+            self.len
+        );
+        let mut view = self.data.slice_mut(offset..offset + src.len());
+        ctx.stream
+            .memcpy_htod(src, &mut view)
+            .map_err(|e| anyhow!("H2D region copy failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Copy a region within the same device buffer or between buffers (D2D).
+    ///
+    /// Copies `len` elements from `src_offset` in `src` to `dst_offset` in `self`.
+    pub fn copy_region_from_device(
+        &mut self,
+        ctx: &DeviceContext,
+        dst_offset: usize,
+        src: &DeviceVec,
+        src_offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        assert!(
+            src_offset + len <= src.len,
+            "copy_region_from_device: src_offset {} + len {} exceeds src len {}",
+            src_offset,
+            len,
+            src.len
+        );
+        assert!(
+            dst_offset + len <= self.len,
+            "copy_region_from_device: dst_offset {} + len {} exceeds dst len {}",
+            dst_offset,
+            len,
+            self.len
+        );
+        let src_view = src.data.slice(src_offset..src_offset + len);
+        let mut dst_view = self.data.slice_mut(dst_offset..dst_offset + len);
+        ctx.stream
+            .memcpy_dtod(&src_view, &mut dst_view)
+            .map_err(|e| anyhow!("D2D region copy failed: {}", e))?;
+        Ok(())
+    }
+
     /// Copy to host as f32 (for testing)
     #[cfg(test)]
     pub(crate) fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {

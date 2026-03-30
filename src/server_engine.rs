@@ -360,7 +360,16 @@ pub struct GenericServerEngine<M: ModelForward> {
 
 impl<M: ModelForward> GenericServerEngine<M> {
     /// Prepare state for a new request, reusing cached KV prefix where possible.
-    /// Returns the tokens that still need to be processed (the non-cached suffix).
+    ///
+    /// Returns the tokens that still need to be processed (the non-cached suffix)
+    /// and the prefix length that was reused.
+    ///
+    /// Key optimizations:
+    /// - **Full prefix hit**: Reuse entire cached KV, only prefill the new suffix.
+    /// - **Partial prefix hit**: Truncate KV to the common prefix (no full reset),
+    ///   then prefill from the divergence point. Saves re-computing the shared part.
+    /// - **KV offload prefetch**: If KV data was offloaded to CPU, automatically
+    ///   prefetch it back to GPU before the prefill starts.
     fn prepare_with_prefix_cache(&mut self, prompt_tokens: &[u32]) -> Result<(Vec<u32>, usize)> {
         let prefix_len = self
             .cached_prompt
@@ -370,9 +379,7 @@ impl<M: ModelForward> GenericServerEngine<M> {
             .count();
 
         if prefix_len > 0 && prefix_len == self.cached_prompt.len() {
-            // Cached prompt is a prefix of the new prompt — reuse KV cache.
-            // KV cache already has entries for cached_prompt[..prefix_len].
-            // Only need to prefill prompt_tokens[prefix_len..].
+            // Full prefix hit — reuse all cached KV.
             let suffix = prompt_tokens[prefix_len..].to_vec();
             info!(
                 "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
@@ -381,18 +388,19 @@ impl<M: ModelForward> GenericServerEngine<M> {
                 prefix_len as f64 / prompt_tokens.len() as f64 * 100.0
             );
             Ok((suffix, prefix_len))
-        } else if prefix_len > 0 && prefix_len < self.cached_prompt.len() {
-            // Cached prompt diverges — the KV cache contains entries beyond the
-            // common prefix that are now invalid. We must reset and re-prefill.
+        } else if prefix_len > 0 {
+            // Partial prefix hit — truncate KV to common prefix and reuse it.
+            // This avoids re-computing the shared prefix entirely.
             info!(
-                "KV prefix cache PARTIAL: common={}, cached={}, new={} — resetting",
+                "KV prefix cache PARTIAL: reusing {}/{} common tokens, truncating {} stale tokens",
                 prefix_len,
-                self.cached_prompt.len(),
-                prompt_tokens.len()
+                prompt_tokens.len(),
+                self.cached_prompt.len() - prefix_len,
             );
-            self.state.reset()?;
-            self.cached_prompt.clear();
-            Ok((prompt_tokens.to_vec(), 0))
+            self.state.truncate_to(prefix_len)?;
+            self.cached_prompt.truncate(prefix_len);
+            let suffix = prompt_tokens[prefix_len..].to_vec();
+            Ok((suffix, prefix_len))
         } else {
             // No prefix match — full reset.
             info!("KV prefix cache MISS: resetting");
