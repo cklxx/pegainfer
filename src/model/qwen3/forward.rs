@@ -41,8 +41,12 @@ impl GenerationState for Qwen3State {
     fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.kv_cache.truncate_to(len);
         self.prefill_logits = None;
-        self.graph_state = CudaGraphState::new(); // Invalidate CUDA graph
+        self.graph_state = CudaGraphState::new();
         Ok(())
+    }
+
+    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
 }
 

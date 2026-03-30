@@ -359,6 +359,12 @@ pub struct GenericServerEngine<M: ModelForward> {
 }
 
 impl<M: ModelForward> GenericServerEngine<M> {
+    /// Set the maximum KV cache tokens to keep on GPU.
+    /// Tokens beyond this are offloaded to CPU. Used to simulate memory pressure.
+    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        self.state.set_max_gpu_kv(max_tokens);
+    }
+
     /// Prepare state for a new request, reusing cached KV prefix where possible.
     ///
     /// Returns the tokens that still need to be processed (the non-cached suffix)

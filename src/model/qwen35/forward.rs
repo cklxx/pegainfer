@@ -44,10 +44,12 @@ impl GenerationState for Qwen35State {
         self.kv_cache.truncate_to(len);
         self.graph_state = CudaGraphState::new();
         self.prefill_logits = None;
-        // Note: recurrent_state for Qwen3.5 linear layers cannot be truncated
-        // (it's a running state, not positional). Reset it on truncation.
         self.recurrent_state.reset(&self.ctx)?;
         Ok(())
+    }
+
+    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
 }
 

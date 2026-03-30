@@ -24,8 +24,9 @@ pub trait GenerationState {
     fn logits(&self) -> &DeviceVec;
     fn reset(&mut self) -> Result<()>;
     /// Truncate KV cache to `len` tokens, keeping the first `len` tokens.
-    /// Used for partial prefix reuse.
     fn truncate_to(&mut self, len: usize) -> Result<()>;
+    /// Set max KV tokens on GPU. Excess offloads to CPU.
+    fn set_max_gpu_kv(&mut self, max_tokens: usize);
 }
 
 /// Deep module interface: one `forward` method hides prefill/decode strategy,
