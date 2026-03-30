@@ -13,6 +13,7 @@ use crate::tensor::DeviceVec;
 
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
+    pub(super) ctx: crate::tensor::DeviceContext,
     pub(super) decode_bufs: DecodeBuffers,
     pub(super) kv_cache: KVCache,
     pub(super) graph_state: CudaGraphState,
@@ -48,6 +49,10 @@ impl GenerationState for Qwen3State {
     fn set_max_gpu_kv(&mut self, max_tokens: usize) {
         self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
+
+    fn offload_kv_if_needed(&mut self) -> Result<()> {
+        self.kv_cache.offload_if_needed(&self.ctx)
+    }
 }
 
 impl ModelForward for Qwen3Model {
@@ -55,6 +60,7 @@ impl ModelForward for Qwen3Model {
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
+            ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
             kv_cache: KVCache::new(
                 self.config.num_hidden_layers,
@@ -66,8 +72,9 @@ impl ModelForward for Qwen3Model {
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
-        // If KV data was offloaded to CPU, prefetch it back to GPU before computation.
-        if state.kv_cache.has_offloaded() {
+        // Prefetch offloaded KV before PREFILL only (not every decode step).
+        // During decode of a single request, all KV stays on GPU.
+        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
             state.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
@@ -87,8 +94,10 @@ impl ModelForward for Qwen3Model {
             state.prefill_logits = Some(logits);
         }
 
-        // After computation, offload excess KV to CPU if GPU is over budget.
-        state.kv_cache.offload_if_needed(&self.ctx)?;
+        // NOTE: offload_if_needed is NOT called here. It is called between
+        // requests in GenericServerEngine, after complete()/complete_stream()
+        // finishes the entire generation. During a single request's decode
+        // loop, all KV stays on GPU for correct attention.
 
         Ok(())
     }

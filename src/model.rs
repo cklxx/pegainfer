@@ -27,6 +27,8 @@ pub trait GenerationState {
     fn truncate_to(&mut self, len: usize) -> Result<()>;
     /// Set max KV tokens on GPU. Excess offloads to CPU.
     fn set_max_gpu_kv(&mut self, max_tokens: usize);
+    /// Offload excess KV to CPU if over GPU budget. Called between requests.
+    fn offload_kv_if_needed(&mut self) -> Result<()>;
 }
 
 /// Deep module interface: one `forward` method hides prefill/decode strategy,

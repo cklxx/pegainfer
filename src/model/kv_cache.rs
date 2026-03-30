@@ -12,7 +12,7 @@ use log::info;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
-const OFFLOAD_BLOCK_SIZE: usize = 256;
+const OFFLOAD_BLOCK_SIZE: usize = 64;
 
 /// KV Cache — contiguous buffers for fused attention.
 pub(crate) struct KVCache {
@@ -232,6 +232,36 @@ impl KVCache {
     /// - The CUDA kernels will be told `seq_len = gpu_seq_len` until
     ///   `ensure_on_gpu()` is called.
     pub(crate) fn offload_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
+        // If the full sequence was restored to GPU by ensure_on_gpu(), we need to
+        // first move the prefix back to its CPU-only state before computing what
+        // else needs offloading. Otherwise we'd re-offload already-offloaded data.
+        if self.gpu_has_full_seq && self.offloaded_len > 0 {
+            // GPU has [0..seq_len] with [0..offloaded_len] being the restored prefix.
+            // Shift the new portion left so GPU has [0..gpu_tokens] = only the new data.
+            let ept = self.elems_per_token();
+            let offloaded_elems = self.offloaded_len * ept;
+            let gpu_tokens = self.seq_len - self.offloaded_len;
+            let gpu_elems = gpu_tokens * ept;
+
+            if gpu_elems > 0 {
+                for layer in 0..self.num_layers {
+                    let mut temp = vec![bf16::ZERO; gpu_elems];
+
+                    self.k_cache[layer].copy_region_to_host(
+                        ctx, offloaded_elems, gpu_elems, &mut temp,
+                    )?;
+                    self.k_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
+
+                    self.v_cache[layer].copy_region_to_host(
+                        ctx, offloaded_elems, gpu_elems, &mut temp,
+                    )?;
+                    self.v_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
+                }
+                ctx.sync()?;
+            }
+            self.gpu_has_full_seq = false;
+        }
+
         let gpu_tokens = self.seq_len - self.offloaded_len;
         if gpu_tokens <= self.max_gpu_seq_len {
             return Ok(());
@@ -259,9 +289,9 @@ impl KVCache {
             self.offloaded_len + tokens_to_offload,
         );
 
-        // For each layer, copy the oldest tokens to CPU, then shift GPU data left.
+        // GPU buffer now has [0..gpu_tokens] = only the non-offloaded portion.
+        // Copy oldest `tokens_to_offload` tokens to CPU, then shift remaining left.
         for layer in 0..self.num_layers {
-            // 1. Copy oldest `tokens_to_offload` tokens from GPU to CPU.
             let mut host_buf = vec![bf16::ZERO; offload_elems];
 
             self.k_cache[layer].copy_region_to_host(ctx, 0, offload_elems, &mut host_buf)?;
@@ -270,9 +300,6 @@ impl KVCache {
             self.v_cache[layer].copy_region_to_host(ctx, 0, offload_elems, &mut host_buf)?;
             self.v_host[layer].extend_from_slice(&host_buf);
 
-            // 2. Shift remaining GPU data left via host bounce.
-            // We can't slice the same CudaSlice mutably and immutably, so we
-            // bounce through a host buffer.
             let remaining_tokens = gpu_tokens - tokens_to_offload;
             let remaining_elems = remaining_tokens * ept;
             if remaining_elems > 0 {
@@ -291,7 +318,6 @@ impl KVCache {
             }
         }
 
-        // Sync to ensure all copies complete before we update bookkeeping.
         ctx.sync()?;
 
         self.offloaded_len += tokens_to_offload;

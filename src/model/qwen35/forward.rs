@@ -51,6 +51,10 @@ impl GenerationState for Qwen35State {
     fn set_max_gpu_kv(&mut self, max_tokens: usize) {
         self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
+
+    fn offload_kv_if_needed(&mut self) -> Result<()> {
+        self.kv_cache.offload_if_needed(&self.ctx)
+    }
 }
 
 impl ModelForward for Qwen35Model {
@@ -72,8 +76,8 @@ impl ModelForward for Qwen35Model {
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
-        // Prefetch offloaded KV from CPU to GPU before computation.
-        if state.kv_cache.has_offloaded() {
+        // Prefetch offloaded KV before PREFILL only.
+        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
             state.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
@@ -91,9 +95,6 @@ impl ModelForward for Qwen35Model {
                 self.prefill_forward(tokens, &mut state.kv_cache, &mut state.recurrent_state)?;
             state.prefill_logits = Some(logits);
         }
-
-        // Offload excess KV to CPU if over GPU budget.
-        state.kv_cache.offload_if_needed(&self.ctx)?;
 
         Ok(())
     }

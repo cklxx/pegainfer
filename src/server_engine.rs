@@ -441,8 +441,9 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             &req.sampling,
             &mut self.rng,
         )?;
-        // Update cached prompt for prefix reuse on next request
+        // Update cached prompt and offload excess KV for next request
         self.cached_prompt = prompt_tokens.clone();
+        self.state.offload_kv_if_needed()?;
         // output_tokens = effective_prompt + generated tokens
         let completion_tokens = output_tokens.len().saturating_sub(effective.len());
         let mut text = self
@@ -608,8 +609,9 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             }),
         });
 
-        // Update cached prompt for prefix reuse on next request
+        // Update cached prompt and offload excess KV for next request
         self.cached_prompt = prompt_tokens;
+        self.state.offload_kv_if_needed()?;
 
         Ok(())
     }
